@@ -18,14 +18,22 @@ package dev.morling.onebrc;
 import java.io.IOException;
 import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
-import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
-import java.util.*;
-import java.util.concurrent.*;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.TreeMap;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 public class CalculateAverage_yah {
 
@@ -34,8 +42,8 @@ public class CalculateAverage_yah {
     private static final int MAX_STATION_NAME_SIZE = 100;
 
     private record ResultRow(double min, double mean, double max) {
-        public ResultRow(MeasurementAggregator agg) {
-            this(agg.min, (Math.round(agg.sum * 10.0) / 10.0) / agg.count, agg.max);
+        public ResultRow(StationAggregator aggregator) {
+            this(aggregator.min, (Math.round(aggregator.sum * 10.0) / 10.0) / aggregator.count, aggregator.max);
         }
 
         public String toString() {
@@ -47,15 +55,27 @@ public class CalculateAverage_yah {
         }
     }
 
-    private static class MeasurementAggregator {
-        private final String station;
+    private static final class StationAggregator {
+        final int hash;
+
+        final byte[] nameBuffer;
+        final int nameOffset;
+        final int nameLength;
+
+        StationAggregator next;
+
         private double min = Double.POSITIVE_INFINITY;
         private double max = Double.NEGATIVE_INFINITY;
         private double sum;
         private long count;
 
-        public MeasurementAggregator(String station) {
-            this.station = station;
+        private String stationName;
+
+        private StationAggregator(int hash, byte[] nameBuffer, int nameOffset, int nameLength) {
+            this.hash = hash;
+            this.nameBuffer = nameBuffer;
+            this.nameOffset = nameOffset;
+            this.nameLength = nameLength;
         }
 
         public void add(double value) {
@@ -65,21 +85,81 @@ public class CalculateAverage_yah {
             count++;
         }
 
-        public MeasurementAggregator merge(MeasurementAggregator other) {
+        public StationAggregator merge(StationAggregator other) {
             min = Math.min(min, other.min);
             max = Math.max(max, other.max);
             sum += other.sum;
             count += other.count;
             return this;
         }
+
+        public String getStationName() {
+            if (stationName == null)
+                stationName = new String(nameBuffer, nameOffset, nameLength, StandardCharsets.UTF_8);
+            return stationName;
+        }
+
     }
 
-    private static final class Task implements Callable<Collection<MeasurementAggregator>> {
+    private static final class AggregatorsMap {
+        private final byte[] namesBuffer = new byte[MAX_STATION_NAMES * MAX_STATION_NAME_SIZE];
+        private int namesBufferSize;
+
+        private final StationAggregator[] entries = new StationAggregator[MAX_STATION_NAMES];
+        private int size;
+
+        StationAggregator get(byte[] name, int length) {
+            int hash = murmur3_32(name, length , 0);
+            int aggregatorIndex = (int) (Integer.toUnsignedLong(hash) % entries.length);
+            StationAggregator aggregator = entries[aggregatorIndex];
+
+            if (aggregator != null) {
+                StationAggregator last = null;
+                while (aggregator != null && aggregator.hash != hash) {
+                    last = aggregator;
+                    aggregator = aggregator.next;
+                }
+                if (aggregator == null)
+                    aggregator = last.next = createAggregator(hash, name, length);
+//                else {
+//                    if (!Arrays.equals(aggregator.nameBuffer, aggregator.nameOffset, aggregator.nameOffset + aggregator.nameLength,
+//                            name, 0, length)) {
+//                        System.out.println("collision " + aggregator.getStationName() + " != " + new String(namesBuffer, 0, length, StandardCharsets.UTF_8));
+//                    }
+//                }
+            } else {
+                aggregator = entries[aggregatorIndex] = createAggregator(hash, name, length);
+            }
+            return aggregator;
+        }
+
+        private StationAggregator createAggregator(int hash, byte[] name, int length) {
+            int nameOffset = namesBufferSize;
+            System.arraycopy(name, 0, namesBuffer, nameOffset, length);
+            namesBufferSize += length;
+            size++;
+            return new StationAggregator(hash, namesBuffer, nameOffset, length);
+        }
+
+        public Collection<StationAggregator> values() {
+            ArrayList<StationAggregator> list = new ArrayList<>(size);
+            for (StationAggregator value : entries) {
+                StationAggregator aggregator = value;
+                while (aggregator != null) {
+                    list.add(aggregator);
+                    aggregator = aggregator.next;
+                }
+            }
+            return list;
+        }
+
+    }
+
+    private static final class Task implements Callable<Collection<StationAggregator>> {
         private final long position;
         private final int size;
-        private final byte[] stringBuffer = new byte[MAX_STATION_NAME_SIZE];
 
-        private final Map<String, MeasurementAggregator> aggregators = new HashMap<>(MAX_STATION_NAMES);
+        private final AggregatorsMap aggregators = new AggregatorsMap();
 
         private Task(long position, int size) {
             this.position = position;
@@ -87,7 +167,7 @@ public class CalculateAverage_yah {
         }
 
         @Override
-        public Collection<MeasurementAggregator> call() throws IOException {
+        public Collection<StationAggregator> call() throws IOException {
             MappedByteBuffer buffer;
             try (FileChannel fileChannel = FileChannel.open(Paths.get(FILE), StandardOpenOption.READ)) {
                 buffer = fileChannel.map(FileChannel.MapMode.READ_ONLY, position, size);
@@ -95,44 +175,118 @@ public class CalculateAverage_yah {
             if (position > 0)
                 skipToNextLine(buffer);
             long endPosition = position + size;
+            byte[] nameBuffer = new byte[MAX_STATION_NAME_SIZE];
             while (buffer.position() < endPosition) {
-                String station = nextString(buffer, StandardCharsets.UTF_8);
-                if (station == null)
+                int length = nextToken(nameBuffer, buffer, ';');
+                if (length == 0)
                     break;
-                String value = nextString(buffer, StandardCharsets.US_ASCII);
-                if (value == null)
+                var aggregator = aggregators.get(nameBuffer, length);
+                length = nextToken(nameBuffer, buffer, '\n');
+                if (length == 0)
                     break;
-                aggregators.computeIfAbsent(station, MeasurementAggregator::new).add(Double.parseDouble(value));
+                aggregator.add(parseValue(nameBuffer));
             }
             return aggregators.values();
         }
 
-        private void skipToNextLine(MappedByteBuffer buffer) {
-            while (buffer.hasRemaining()) {
-                if (buffer.get() == '\n') break;
-            }
-        }
-
-        private String nextString(MappedByteBuffer buffer, Charset charset) {
-            int length = 0;
-            while (buffer.hasRemaining()) {
-                byte b = buffer.get();
-                if (b == ';' || b == '\n')
-                    return length > 0 ? new String(stringBuffer, 0, length, charset) : null;
-                stringBuffer[length++] = b;
-            }
-            return null;
-        }
-
     }
 
+    private static void skipToNextLine(MappedByteBuffer buffer) {
+        while (buffer.hasRemaining()) {
+            if (buffer.get() == '\n')
+                break;
+        }
+    }
+
+    private static int nextToken(byte[] dst, MappedByteBuffer src, char separator) {
+        int length = 0;
+        while (src.hasRemaining()) {
+            byte b = src.get();
+            if (b == separator)
+                return length;
+            dst[length++] = b;
+        }
+        return 0;
+    }
+
+    // hash function
+    private static int murmur_32_scramble(int k) {
+        k *= 0xcc9e2d51;
+        k = (k << 15) | (k >> 17);
+        k *= 0x1b873593;
+        return k;
+    }
+
+    private static int murmur3_32(byte[] key, int len, int seed) {
+        int h = seed, k, keyIdx = 0;
+        /* Read in groups of 4. */
+        for (int i = len >> 2; i > 0; i--) {
+            // Here is a source of differing results across endiannesses.
+            // A swap here has no effects on hash properties though.
+            k = toInt(key, keyIdx);
+            keyIdx += 4;
+            h ^= murmur_32_scramble(k);
+            h = (h << 13) | (h >> 19);
+            h = h * 5 + 0xe6546b64;
+        }
+        /* Read the rest. */
+        k = 0;
+        for (int i = len & 3; i > 0; i--) {
+            k <<= 8;
+            k |= key[i - 1];
+        }
+        // A swap is *not* necessary here because the preceding loop already
+        // places the low bytes in the low places according to whatever endianness
+        // we use. Swaps only apply when the memory is copied in a chunk.
+        h ^= murmur_32_scramble(k);
+        /* Finalize. */
+        h ^= len;
+        h ^= h >> 16;
+        h *= 0x85ebca6b;
+        h ^= h >> 13;
+        h *= 0xc2b2ae35;
+        h ^= h >> 16;
+        return h;
+    }
+
+    private static int toInt(byte[] key, int idx) {
+        int i = key[idx] << 24;
+        i |= key[idx + 1] << 16;
+        i |= key[idx + 2] << 8;
+        i |= key[idx + 3];
+        return i;
+    }
+
+    // value parsing
+    private static double parseValue(byte[] s) {
+        int i, sign;
+        if (s[0] == '-') {
+            i = 1;
+            sign = -1;
+        } else {
+            i = 0;
+            sign = 1;
+        }
+        double d = parseDigit(s, i++);
+        if (s[i] != '.')
+            d = d * 10 + parseDigit(s, i++);
+        i++; // skip '.'
+        d += parseDigit(s, i) * 0.1;
+        return d * sign;
+    }
+
+    private static int parseDigit(byte[] s, int index) {
+        return (char) s[index] - '0';
+    }
+
+    // main
     public static void main(String[] args) throws IOException, InterruptedException, ExecutionException {
         long start = System.currentTimeMillis();
         Path path = Paths.get(FILE);
         long fileSize = Files.size(path);
         int threads = Runtime.getRuntime().availableProcessors();
         int chunkSize = (int) Math.min(Math.ceilDiv(fileSize, threads), Integer.MAX_VALUE);
-        List<Future<Collection<MeasurementAggregator>>> futures = new ArrayList<>();
+        List<Future<Collection<StationAggregator>>> futures = new ArrayList<>();
         try (ExecutorService executor = Executors.newFixedThreadPool(threads)) {
             long offset = 0;
             while (offset < fileSize) {
@@ -142,15 +296,14 @@ public class CalculateAverage_yah {
                 offset += size;
             }
         }
-        Map<String, MeasurementAggregator> aggregators = new HashMap<>(MAX_STATION_NAMES);
-        for (Future<Collection<MeasurementAggregator>> future : futures) {
-            future.get().forEach(aggregator -> aggregators.merge(aggregator.station, aggregator, MeasurementAggregator::merge));
+        Map<String, StationAggregator> aggregators = new HashMap<>(MAX_STATION_NAMES);
+        for (Future<Collection<StationAggregator>> future : futures) {
+            future.get().forEach(agg -> aggregators.merge(agg.getStationName(), agg, StationAggregator::merge));
         }
         Map<String, ResultRow> measurements = new TreeMap<>();
         aggregators.forEach((name, agg) -> measurements.put(name, new ResultRow(agg)));
         long time = System.currentTimeMillis() - start;
         System.out.println(measurements);
-        System.err.printf("time=%dms : %02d:%02d:%03d",
-                time, Math.floorDiv(time / 1000, 60), Math.floorMod(time / 1000, 60), Math.floorMod(time, 1000));
+        System.err.printf("time=%dms : %02d:%02d:%03d", time, Math.floorDiv(time / 1000, 60), Math.floorMod(time / 1000, 60), Math.floorMod(time, 1000));
     }
 }
