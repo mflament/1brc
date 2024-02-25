@@ -150,6 +150,7 @@ public class CalculateAverage_yah {
         aggregators.forEach((name, agg) -> measurements.put(name, new ResultRow(agg)));
         long time = System.currentTimeMillis() - start;
         System.out.println(measurements);
-        System.err.println(STR."time=\{time}");
+        System.err.printf("time=%dms : %02d:%02d:%03d",
+                time, Math.floorDiv(time / 1000, 60), Math.floorMod(time / 1000, 60), Math.floorMod(time, 1000));
     }
 }
